@@ -481,7 +481,7 @@ def validate_data_subject_match(
         email_lower = data_subject_email.lower()
         email_matches = [
             m for m in matches
-            if m.get('email', '').lower() == email_lower
+            if (m.get('email') or '').lower() == email_lower
         ]
         if len(email_matches) == 1:
             return email_matches[0]
