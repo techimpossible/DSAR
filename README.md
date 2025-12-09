@@ -238,7 +238,7 @@ pytest tests/test_redaction.py -v
 
 ## License
 
-[Your License Here]
+MIT License - see [LICENSE](LICENSE) for details.
 
 ## Contributing
 
