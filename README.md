@@ -94,7 +94,8 @@ python slack_dsar.py export.zip "John Smith" --email john@company.com --redact "
 ```bash
 cd scripts
 python compile_package.py ./output "John Smith" --email john@company.com \
-    --company "Your Company" --dpo "Privacy Officer" --dpo-email dpo@company.com
+    --request-date "2025-01-15" --company "Your Company" \
+    --dpo-name "Privacy Officer" --dpo-email dpo@company.com
 ```
 
 ## Directory Structure
