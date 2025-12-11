@@ -29,6 +29,7 @@ import sys
 import os
 import json
 import zipfile
+import time
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 
@@ -49,6 +50,7 @@ from core.utils import (
     print_progress,
     strip_html,
 )
+from core.activity_log import log_event
 
 VENDOR_NAME = "Slack"
 
@@ -363,109 +365,153 @@ def process(
     Returns:
         Tuple of (docx_path, json_path)
     """
+    start_time = time.time()
+
     ensure_output_dir(output_dir)
     ensure_output_dir(os.path.join(output_dir, 'internal'))
 
-    # 1. Load export
-    print(f"Loading Slack export from {export_path}...")
-    data = load_slack_export(export_path)
-    print(f"  Found {len(data['users'])} users, {len(data['channels'])} channels, {len(data['messages'])} messages")
-
-    # 2. Find data subject
-    print(f"Searching for data subject: {data_subject_name}...")
-    data_subject = find_data_subject(data, data_subject_name, data_subject_email)
-    ds_id = data_subject['id']
-    print(f"  Found: {data_subject['name']} ({data_subject.get('email', 'no email')})")
-
-    # 3. Build redaction engine
-    print("Building redaction map...")
-    engine = RedactionEngine(data_subject_name, data_subject_email)
-
-    # 4. Add all users to redaction map
-    users = extract_users(data)
-    for user_id, user_info in users.items():
-        engine.add_user(
-            user_id,
-            user_info.get('name'),
-            user_info.get('email'),
-            user_info.get('is_bot', False)
-        )
-    print(f"  Mapped {engine.get_total_redactions()} users for redaction")
-
-    # 5. Add extra redactions
-    for name in (extra_redactions or []):
-        engine.add_external(name)
-
-    # 6. Extract profile and records
-    print("Extracting profile data...")
-    profile = extract_profile(data_subject)
-
-    print("Extracting activity records...")
-    records = extract_records(data, ds_id)
-    print(f"  Found {len(records)} records for data subject")
-
-    # 7. Extract channel memberships
-    memberships = extract_channel_memberships(data, ds_id)
-
-    # 8. Apply redaction to records
-    print("Applying redactions...")
-    redacted_records = []
-    for i, record in enumerate(records):
-        print_progress(i + 1, len(records), "Redacting")
-        redacted = record.copy()
-        if 'content' in redacted:
-            redacted['content'] = engine.redact(str(redacted['content']))
-        redacted_records.append(redacted)
-
-    # 9. Generate outputs
-    safe_name = safe_filename(data_subject_name)
-    timestamp = get_timestamp()
-
-    # Word document
-    print("Generating Word report...")
-    doc = create_vendor_report(
-        vendor_name=VENDOR_NAME,
+    # Log processing start
+    log_event(
+        'processing_started',
+        output_dir=output_dir,
+        vendor=VENDOR_NAME,
         data_subject_name=data_subject_name,
         data_subject_email=data_subject_email,
-        profile_data=profile,
-        records=redacted_records,
-        categories=memberships,
-        redaction_stats=engine.get_stats(),
-        export_filename=os.path.basename(export_path)
+        export_file=os.path.basename(export_path),
     )
-    docx_path = os.path.join(output_dir, f"{VENDOR_NAME}_DSAR_{safe_name}_{timestamp}.docx")
-    doc.save(docx_path)
 
-    # JSON export
-    print("Generating JSON export...")
-    json_data = {
-        'vendor': VENDOR_NAME,
-        'data_subject': data_subject_name,
-        'email': data_subject_email,
-        'generated': datetime.now().isoformat(),
-        'profile': profile,
-        'memberships': memberships,
-        'records': redacted_records,
-        'record_count': len(redacted_records),
-    }
-    json_path = os.path.join(output_dir, f"{VENDOR_NAME}_DSAR_{safe_name}_{timestamp}.json")
-    save_json(json_data, json_path)
+    try:
+        # 1. Load export
+        print(f"Loading Slack export from {export_path}...")
+        data = load_slack_export(export_path)
+        print(f"  Found {len(data['users'])} users, {len(data['channels'])} channels, {len(data['messages'])} messages")
 
-    # Redaction key (INTERNAL)
-    key_path = os.path.join(
-        output_dir, 'internal',
-        f"{VENDOR_NAME}_REDACTION_KEY_{safe_name}_{timestamp}.json"
-    )
-    save_json(engine.get_redaction_key(), key_path)
+        # 2. Find data subject
+        print(f"Searching for data subject: {data_subject_name}...")
+        data_subject = find_data_subject(data, data_subject_name, data_subject_email)
+        ds_id = data_subject['id']
+        print(f"  Found: {data_subject['name']} ({data_subject.get('email', 'no email')})")
 
-    # Summary
-    stats = engine.get_stats()
-    print(f"\n✓ {VENDOR_NAME}: {len(redacted_records)} records processed")
-    print(f"  Redacted: {stats['user']} users, {stats['bot']} bots, {stats['external']} external")
-    print(f"  → {docx_path}")
-    print(f"  → {json_path}")
+        # 3. Build redaction engine
+        print("Building redaction map...")
+        engine = RedactionEngine(data_subject_name, data_subject_email)
 
-    return docx_path, json_path
+        # 4. Add all users to redaction map
+        users = extract_users(data)
+        for user_id, user_info in users.items():
+            engine.add_user(
+                user_id,
+                user_info.get('name'),
+                user_info.get('email'),
+                user_info.get('is_bot', False)
+            )
+        print(f"  Mapped {engine.get_total_redactions()} users for redaction")
+
+        # 5. Add extra redactions
+        for name in (extra_redactions or []):
+            engine.add_external(name)
+
+        # 6. Extract profile and records
+        print("Extracting profile data...")
+        profile = extract_profile(data_subject)
+
+        print("Extracting activity records...")
+        records = extract_records(data, ds_id)
+        print(f"  Found {len(records)} records for data subject")
+
+        # 7. Extract channel memberships
+        memberships = extract_channel_memberships(data, ds_id)
+
+        # 8. Apply redaction to records
+        print("Applying redactions...")
+        redacted_records = []
+        for i, record in enumerate(records):
+            print_progress(i + 1, len(records), "Redacting")
+            redacted = record.copy()
+            if 'content' in redacted:
+                redacted['content'] = engine.redact(str(redacted['content']))
+            redacted_records.append(redacted)
+
+        # 9. Generate outputs
+        safe_name = safe_filename(data_subject_name)
+        timestamp = get_timestamp()
+
+        # Word document
+        print("Generating Word report...")
+        doc = create_vendor_report(
+            vendor_name=VENDOR_NAME,
+            data_subject_name=data_subject_name,
+            data_subject_email=data_subject_email,
+            profile_data=profile,
+            records=redacted_records,
+            categories=memberships,
+            redaction_stats=engine.get_stats(),
+            export_filename=os.path.basename(export_path)
+        )
+        docx_path = os.path.join(output_dir, f"{VENDOR_NAME}_DSAR_{safe_name}_{timestamp}.docx")
+        doc.save(docx_path)
+
+        # JSON export
+        print("Generating JSON export...")
+        json_data = {
+            'vendor': VENDOR_NAME,
+            'data_subject': data_subject_name,
+            'email': data_subject_email,
+            'generated': datetime.now().isoformat(),
+            'profile': profile,
+            'memberships': memberships,
+            'records': redacted_records,
+            'record_count': len(redacted_records),
+        }
+        json_path = os.path.join(output_dir, f"{VENDOR_NAME}_DSAR_{safe_name}_{timestamp}.json")
+        save_json(json_data, json_path)
+
+        # Redaction key (INTERNAL)
+        key_path = os.path.join(
+            output_dir, 'internal',
+            f"{VENDOR_NAME}_REDACTION_KEY_{safe_name}_{timestamp}.json"
+        )
+        save_json(engine.get_redaction_key(), key_path)
+
+        # Summary
+        stats = engine.get_stats()
+        print(f"\n✓ {VENDOR_NAME}: {len(redacted_records)} records processed")
+        print(f"  Redacted: {stats['user']} users, {stats['bot']} bots, {stats['external']} external")
+        print(f"  → {docx_path}")
+        print(f"  → {json_path}")
+
+        # Log successful completion
+        elapsed = time.time() - start_time
+        log_event(
+            'processing_complete',
+            output_dir=output_dir,
+            vendor=VENDOR_NAME,
+            data_subject_name=data_subject_name,
+            data_subject_email=data_subject_email,
+            status='success',
+            records_found=len(records),
+            records_processed=len(redacted_records),
+            redaction_stats=stats,
+            files_generated=[os.path.basename(docx_path), os.path.basename(json_path)],
+            execution_time_seconds=round(elapsed, 2),
+        )
+
+        return docx_path, json_path
+
+    except Exception as e:
+        # Log failure
+        elapsed = time.time() - start_time
+        log_event(
+            'processing_failed',
+            output_dir=output_dir,
+            vendor=VENDOR_NAME,
+            data_subject_name=data_subject_name,
+            data_subject_email=data_subject_email,
+            status='failure',
+            error=str(e),
+            execution_time_seconds=round(elapsed, 2),
+        )
+        raise
 
 
 if __name__ == '__main__':

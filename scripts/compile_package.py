@@ -36,6 +36,7 @@ import json
 import zipfile
 import shutil
 import argparse
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -45,6 +46,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from core.docgen import create_cover_letter
 from core.utils import safe_filename, ensure_output_dir, get_timestamp
+from core.activity_log import log_event, get_activity_summary
 
 
 def discover_vendor_reports(
@@ -164,118 +166,161 @@ def compile_package(
     Returns:
         Path to the created ZIP package
     """
+    start_time = time.time()
     reports_path = Path(reports_dir)
 
-    # 1. Discover all vendor reports
-    print("Discovering vendor reports...")
-    docx_files, json_files, record_counts = discover_vendor_reports(
-        reports_dir, data_subject_name
-    )
-
-    if not docx_files:
-        print(f"No vendor reports found for '{data_subject_name}' in {reports_dir}")
-        print("Ensure vendor processors have been run first.")
-        sys.exit(1)
-
-    print(f"Found reports from {len(docx_files)} vendors")
-
-    # 2. Create package directory
-    timestamp = get_timestamp()
-    safe_name = safe_filename(data_subject_name)
-    package_name = f"DSAR_{safe_name}_{timestamp}"
-    package_dir = reports_path / package_name
-    package_dir.mkdir(exist_ok=True)
-
-    json_export_dir = package_dir / "json_exports"
-    json_export_dir.mkdir(exist_ok=True)
-
-    files_included = []
-
-    # 3. Generate cover letter
-    print("Generating cover letter...")
-    cover_doc = create_cover_letter(
+    # Log compilation start
+    log_event(
+        'package_compilation_started',
+        output_dir=reports_dir,
         data_subject_name=data_subject_name,
         data_subject_email=data_subject_email,
-        vendors_processed=record_counts,
-        request_date=request_date,
+        reports_dir=reports_dir,
         company_name=company_name,
-        dpo_name=dpo_name,
-        dpo_email=dpo_email,
-        company_address=company_address
     )
 
-    cover_path = package_dir / "00_COVER_LETTER.docx"
-    cover_doc.save(str(cover_path))
-    files_included.append("00_COVER_LETTER.docx")
+    try:
+        # 1. Discover all vendor reports
+        print("Discovering vendor reports...")
+        docx_files, json_files, record_counts = discover_vendor_reports(
+            reports_dir, data_subject_name
+        )
 
-    # 4. Copy vendor reports (numbered by vendor name)
-    print("Copying vendor reports...")
-    sorted_vendors = sorted(docx_files.keys())
-    for i, vendor in enumerate(sorted_vendors, start=1):
-        # Copy Word document
-        src_docx = docx_files[vendor]
-        dest_docx = package_dir / f"{i:02d}_{vendor}_DSAR_Report.docx"
-        shutil.copy(src_docx, dest_docx)
-        files_included.append(dest_docx.name)
+        if not docx_files:
+            print(f"No vendor reports found for '{data_subject_name}' in {reports_dir}")
+            print("Ensure vendor processors have been run first.")
+            sys.exit(1)
 
-        # Copy JSON export if exists
-        if vendor in json_files:
-            src_json = json_files[vendor]
-            dest_json = json_export_dir / f"{vendor}_export.json"
-            shutil.copy(src_json, dest_json)
-            files_included.append(f"json_exports/{vendor}_export.json")
+        print(f"Found reports from {len(docx_files)} vendors")
 
-        print(f"  Added {vendor}: {record_counts.get(vendor, 0):,} records")
+        # 2. Create package directory
+        timestamp = get_timestamp()
+        safe_name = safe_filename(data_subject_name)
+        package_name = f"DSAR_{safe_name}_{timestamp}"
+        package_dir = reports_path / package_name
+        package_dir.mkdir(exist_ok=True)
 
-    # 5. Create manifest
-    print("Creating manifest...")
-    manifest = create_manifest(
-        data_subject_name=data_subject_name,
-        data_subject_email=data_subject_email,
-        vendors_processed=record_counts,
-        files_included=files_included,
-        package_created=datetime.now().isoformat()
-    )
+        json_export_dir = package_dir / "json_exports"
+        json_export_dir.mkdir(exist_ok=True)
 
-    manifest_path = package_dir / "manifest.json"
-    with open(manifest_path, 'w', encoding='utf-8') as f:
-        json.dump(manifest, f, indent=2)
-    files_included.append("manifest.json")
+        files_included = []
 
-    # 6. Create ZIP package
-    print("Creating ZIP package...")
-    zip_path = reports_path / f"{package_name}.zip"
+        # 3. Generate cover letter
+        print("Generating cover letter...")
+        cover_doc = create_cover_letter(
+            data_subject_name=data_subject_name,
+            data_subject_email=data_subject_email,
+            vendors_processed=record_counts,
+            request_date=request_date,
+            company_name=company_name,
+            dpo_name=dpo_name,
+            dpo_email=dpo_email,
+            company_address=company_address
+        )
 
-    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-        for file in package_dir.rglob('*'):
-            if file.is_file():
-                arcname = file.relative_to(package_dir)
-                zf.write(file, arcname)
+        cover_path = package_dir / "00_COVER_LETTER.docx"
+        cover_doc.save(str(cover_path))
+        files_included.append("00_COVER_LETTER.docx")
 
-    # 7. Clean up temporary directory
-    shutil.rmtree(package_dir)
+        # 4. Copy vendor reports (numbered by vendor name)
+        print("Copying vendor reports...")
+        sorted_vendors = sorted(docx_files.keys())
+        for i, vendor in enumerate(sorted_vendors, start=1):
+            # Copy Word document
+            src_docx = docx_files[vendor]
+            dest_docx = package_dir / f"{i:02d}_{vendor}_DSAR_Report.docx"
+            shutil.copy(src_docx, dest_docx)
+            files_included.append(dest_docx.name)
 
-    # 8. Print summary
-    print("\n" + "=" * 60)
-    print("DSAR PACKAGE COMPILED SUCCESSFULLY")
-    print("=" * 60)
-    print(f"\nData Subject: {data_subject_name}")
-    print(f"Email: {data_subject_email}")
-    print(f"\nVendors Included: {len(docx_files)}")
-    for vendor in sorted_vendors:
-        print(f"  • {vendor}: {record_counts.get(vendor, 0):,} records")
-    print(f"\nTotal Records: {sum(record_counts.values()):,}")
-    print(f"\nPackage: {zip_path}")
-    print("=" * 60)
+            # Copy JSON export if exists
+            if vendor in json_files:
+                src_json = json_files[vendor]
+                dest_json = json_export_dir / f"{vendor}_export.json"
+                shutil.copy(src_json, dest_json)
+                files_included.append(f"json_exports/{vendor}_export.json")
 
-    # 9. Reminder about internal files
-    internal_dir = reports_path / 'internal'
-    if internal_dir.exists() and any(internal_dir.iterdir()):
-        print("\n⚠️  REMINDER: Internal redaction keys are in:")
-        print(f"   {internal_dir}")
-        print("   DO NOT SEND THESE TO THE DATA SUBJECT!")
+            print(f"  Added {vendor}: {record_counts.get(vendor, 0):,} records")
 
-    return str(zip_path)
+        # 5. Create manifest with activity summary
+        print("Creating manifest...")
+        activity_summary = get_activity_summary(data_subject_name, reports_dir)
+
+        manifest = create_manifest(
+            data_subject_name=data_subject_name,
+            data_subject_email=data_subject_email,
+            vendors_processed=record_counts,
+            files_included=files_included,
+            package_created=datetime.now().isoformat()
+        )
+        # Add processing activity to manifest
+        manifest['processing_activity'] = activity_summary
+
+        manifest_path = package_dir / "manifest.json"
+        with open(manifest_path, 'w', encoding='utf-8') as f:
+            json.dump(manifest, f, indent=2)
+        files_included.append("manifest.json")
+
+        # 6. Create ZIP package
+        print("Creating ZIP package...")
+        zip_path = reports_path / f"{package_name}.zip"
+
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for file in package_dir.rglob('*'):
+                if file.is_file():
+                    arcname = file.relative_to(package_dir)
+                    zf.write(file, arcname)
+
+        # 7. Clean up temporary directory
+        shutil.rmtree(package_dir)
+
+        # 8. Print summary
+        print("\n" + "=" * 60)
+        print("DSAR PACKAGE COMPILED SUCCESSFULLY")
+        print("=" * 60)
+        print(f"\nData Subject: {data_subject_name}")
+        print(f"Email: {data_subject_email}")
+        print(f"\nVendors Included: {len(docx_files)}")
+        for vendor in sorted_vendors:
+            print(f"  • {vendor}: {record_counts.get(vendor, 0):,} records")
+        print(f"\nTotal Records: {sum(record_counts.values()):,}")
+        print(f"\nPackage: {zip_path}")
+        print("=" * 60)
+
+        # 9. Reminder about internal files
+        internal_dir = reports_path / 'internal'
+        if internal_dir.exists() and any(internal_dir.iterdir()):
+            print("\n⚠️  REMINDER: Internal redaction keys are in:")
+            print(f"   {internal_dir}")
+            print("   DO NOT SEND THESE TO THE DATA SUBJECT!")
+
+        # Log successful completion
+        elapsed = time.time() - start_time
+        log_event(
+            'package_compilation_complete',
+            output_dir=reports_dir,
+            data_subject_name=data_subject_name,
+            data_subject_email=data_subject_email,
+            status='success',
+            vendors_included=sorted_vendors,
+            total_records=sum(record_counts.values()),
+            package_file=os.path.basename(str(zip_path)),
+            execution_time_seconds=round(elapsed, 2),
+        )
+
+        return str(zip_path)
+
+    except Exception as e:
+        elapsed = time.time() - start_time
+        log_event(
+            'package_compilation_failed',
+            output_dir=reports_dir,
+            data_subject_name=data_subject_name,
+            data_subject_email=data_subject_email,
+            status='failure',
+            error=str(e),
+            execution_time_seconds=round(elapsed, 2),
+        )
+        raise
 
 
 def main():

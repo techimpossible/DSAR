@@ -19,6 +19,13 @@ from .utils import (
     truncate,
     strip_html,
 )
+from .activity_log import (
+    log_event,
+    read_activity_log,
+    get_activity_summary,
+    get_activity_log_path,
+    clear_activity_log,
+)
 
 __all__ = [
     'RedactionEngine',
@@ -36,4 +43,9 @@ __all__ = [
     'format_date',
     'truncate',
     'strip_html',
+    'log_event',
+    'read_activity_log',
+    'get_activity_summary',
+    'get_activity_log_path',
+    'clear_activity_log',
 ]

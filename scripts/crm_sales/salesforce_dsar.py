@@ -12,6 +12,7 @@ Usage:
 
 import sys
 import os
+import time
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 
@@ -24,6 +25,7 @@ from core.utils import (
     ensure_output_dir, safe_filename, format_date, get_timestamp,
     validate_data_subject_match, strip_html,
 )
+from core.activity_log import log_event
 
 VENDOR_NAME = "Salesforce"
 
@@ -138,51 +140,94 @@ def extract_records(data: Dict[str, Any], data_subject_id: str, data_subject_ema
 
 def process(export_path: str, data_subject_name: str, data_subject_email: str = None,
             extra_redactions: List[str] = None, output_dir: str = './output') -> tuple:
+    start_time = time.time()
+
     ensure_output_dir(output_dir)
     ensure_output_dir(os.path.join(output_dir, 'internal'))
 
-    print(f"Loading {VENDOR_NAME} export...")
-    data = load_json(export_path)
+    log_event(
+        'processing_started',
+        output_dir=output_dir,
+        vendor=VENDOR_NAME,
+        data_subject_name=data_subject_name,
+        data_subject_email=data_subject_email,
+        export_file=os.path.basename(export_path),
+    )
 
-    print(f"Searching for data subject: {data_subject_name}...")
-    data_subject = find_data_subject(data, data_subject_name, data_subject_email)
-    ds_id = data_subject['id']
-    print(f"  Found: {data_subject['name']}")
+    try:
+        print(f"Loading {VENDOR_NAME} export...")
+        data = load_json(export_path)
 
-    engine = RedactionEngine(data_subject_name, data_subject_email)
-    for user_id, user_info in extract_users(data).items():
-        engine.add_user(user_id, user_info.get('name'), user_info.get('email'))
-    for name in (extra_redactions or []):
-        engine.add_external(name)
+        print(f"Searching for data subject: {data_subject_name}...")
+        data_subject = find_data_subject(data, data_subject_name, data_subject_email)
+        ds_id = data_subject['id']
+        print(f"  Found: {data_subject['name']}")
 
-    profile = extract_profile(data_subject)
-    records = extract_records(data, ds_id, data_subject_email)
+        engine = RedactionEngine(data_subject_name, data_subject_email)
+        for user_id, user_info in extract_users(data).items():
+            engine.add_user(user_id, user_info.get('name'), user_info.get('email'))
+        for name in (extra_redactions or []):
+            engine.add_external(name)
 
-    redacted_records = [
-        {**r, 'content': engine.redact(str(r.get('content', '')))} for r in records
-    ]
+        profile = extract_profile(data_subject)
+        records = extract_records(data, ds_id, data_subject_email)
 
-    safe_name = safe_filename(data_subject_name)
-    timestamp = get_timestamp()
+        redacted_records = [
+            {**r, 'content': engine.redact(str(r.get('content', '')))} for r in records
+        ]
 
-    doc = create_vendor_report(VENDOR_NAME, data_subject_name, data_subject_email,
-                               profile, redacted_records, redaction_stats=engine.get_stats(),
-                               export_filename=os.path.basename(export_path))
-    docx_path = os.path.join(output_dir, f"{VENDOR_NAME}_DSAR_{safe_name}_{timestamp}.docx")
-    doc.save(docx_path)
+        safe_name = safe_filename(data_subject_name)
+        timestamp = get_timestamp()
 
-    json_data = {'vendor': VENDOR_NAME, 'data_subject': data_subject_name, 'email': data_subject_email,
-                 'generated': datetime.now().isoformat(), 'profile': profile, 'records': redacted_records,
-                 'record_count': len(redacted_records)}
-    json_path = os.path.join(output_dir, f"{VENDOR_NAME}_DSAR_{safe_name}_{timestamp}.json")
-    save_json(json_data, json_path)
+        doc = create_vendor_report(VENDOR_NAME, data_subject_name, data_subject_email,
+                                   profile, redacted_records, redaction_stats=engine.get_stats(),
+                                   export_filename=os.path.basename(export_path))
+        docx_path = os.path.join(output_dir, f"{VENDOR_NAME}_DSAR_{safe_name}_{timestamp}.docx")
+        doc.save(docx_path)
 
-    key_path = os.path.join(output_dir, 'internal', f"{VENDOR_NAME}_REDACTION_KEY_{safe_name}_{timestamp}.json")
-    save_json(engine.get_redaction_key(), key_path)
+        json_data = {'vendor': VENDOR_NAME, 'data_subject': data_subject_name, 'email': data_subject_email,
+                     'generated': datetime.now().isoformat(), 'profile': profile, 'records': redacted_records,
+                     'record_count': len(redacted_records)}
+        json_path = os.path.join(output_dir, f"{VENDOR_NAME}_DSAR_{safe_name}_{timestamp}.json")
+        save_json(json_data, json_path)
 
-    print(f"\n✓ {VENDOR_NAME}: {len(redacted_records)} records processed")
-    print(f"  → {docx_path}")
-    return docx_path, json_path
+        key_path = os.path.join(output_dir, 'internal', f"{VENDOR_NAME}_REDACTION_KEY_{safe_name}_{timestamp}.json")
+        save_json(engine.get_redaction_key(), key_path)
+
+        stats = engine.get_stats()
+        print(f"\n✓ {VENDOR_NAME}: {len(redacted_records)} records processed")
+        print(f"  → {docx_path}")
+
+        elapsed = time.time() - start_time
+        log_event(
+            'processing_complete',
+            output_dir=output_dir,
+            vendor=VENDOR_NAME,
+            data_subject_name=data_subject_name,
+            data_subject_email=data_subject_email,
+            status='success',
+            records_found=len(records),
+            records_processed=len(redacted_records),
+            redaction_stats=stats,
+            files_generated=[os.path.basename(docx_path), os.path.basename(json_path)],
+            execution_time_seconds=round(elapsed, 2),
+        )
+
+        return docx_path, json_path
+
+    except Exception as e:
+        elapsed = time.time() - start_time
+        log_event(
+            'processing_failed',
+            output_dir=output_dir,
+            vendor=VENDOR_NAME,
+            data_subject_name=data_subject_name,
+            data_subject_email=data_subject_email,
+            status='failure',
+            error=str(e),
+            execution_time_seconds=round(elapsed, 2),
+        )
+        raise
 
 
 if __name__ == '__main__':

@@ -13,6 +13,7 @@ Usage:
 import sys
 import os
 import argparse
+import time
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 
@@ -29,6 +30,7 @@ from core.utils import (
     get_timestamp,
     strip_html,
 )
+from core.activity_log import log_event
 
 VENDOR_NAME = "Generic_CSV"
 
@@ -275,100 +277,141 @@ def process(
     email_col: str = None
 ) -> tuple:
     """Process a CSV export for DSAR response."""
+    start_time = time.time()
+
     ensure_output_dir(output_dir)
     ensure_output_dir(os.path.join(output_dir, 'internal'))
 
-    print(f"Loading CSV export from {export_path}...")
-    rows = load_csv(export_path)
-    print(f"  Loaded {len(rows)} rows")
-
-    if rows:
-        columns = list(rows[0].keys())
-        print(f"  Columns: {', '.join(columns[:10])}{'...' if len(columns) > 10 else ''}")
-
-        # Auto-detect columns
-        detected_name = name_col or detect_column(columns, NAME_COLUMNS)
-        detected_email = email_col or detect_column(columns, EMAIL_COLUMNS)
-        print(f"  Detected name column: {detected_name or 'None'}")
-        print(f"  Detected email column: {detected_email or 'None'}")
-
-    print(f"\nSearching for data subject: {data_subject_name}...")
-    data_subject = find_data_subject(rows, data_subject_name, data_subject_email, name_col, email_col)
-    ds_id = data_subject['id']
-    print(f"  Found: {data_subject['name']} ({data_subject.get('email', 'no email')})")
-
-    print("Building redaction map...")
-    engine = RedactionEngine(data_subject_name, data_subject_email)
-
-    users = extract_users(rows, name_col, email_col)
-    for user_id, user_info in users.items():
-        engine.add_user(user_id, user_info.get('name'), user_info.get('email'))
-    print(f"  Mapped {engine.get_total_redactions()} entities for redaction")
-
-    for name in (extra_redactions or []):
-        engine.add_external(name)
-
-    print("Extracting profile data...")
-    profile = extract_profile(data_subject)
-
-    print("Extracting records...")
-    records = extract_records(rows, data_subject, name_col, email_col)
-    print(f"  Found {len(records)} records for data subject")
-
-    print("Applying redactions...")
-    redacted_records = []
-    for record in records:
-        redacted = record.copy()
-        if 'content' in redacted:
-            redacted['content'] = engine.redact(str(redacted['content']))
-        redacted_records.append(redacted)
-
-    safe_name = safe_filename(data_subject_name)
-    timestamp = get_timestamp()
-
-    # Derive vendor name from filename
-    vendor_name = os.path.splitext(os.path.basename(export_path))[0]
-    vendor_name = vendor_name.replace('_export', '').replace('-export', '')
-    vendor_name = vendor_name.replace('_', ' ').replace('-', ' ').title()
-    if not vendor_name or vendor_name.lower() == 'export':
-        vendor_name = VENDOR_NAME
-
-    print("Generating Word report...")
-    doc = create_vendor_report(
-        vendor_name=vendor_name,
+    log_event(
+        'processing_started',
+        output_dir=output_dir,
+        vendor=VENDOR_NAME,
         data_subject_name=data_subject_name,
         data_subject_email=data_subject_email,
-        profile_data=profile,
-        records=redacted_records,
-        redaction_stats=engine.get_stats(),
-        export_filename=os.path.basename(export_path)
+        export_file=os.path.basename(export_path),
     )
-    docx_path = os.path.join(output_dir, f"{vendor_name.replace(' ', '_')}_DSAR_{safe_name}_{timestamp}.docx")
-    doc.save(docx_path)
 
-    print("Generating JSON export...")
-    json_data = {
-        'vendor': vendor_name,
-        'data_subject': data_subject_name,
-        'email': data_subject_email,
-        'generated': datetime.now().isoformat(),
-        'profile': profile,
-        'records': redacted_records,
-        'record_count': len(redacted_records),
-    }
-    json_path = os.path.join(output_dir, f"{vendor_name.replace(' ', '_')}_DSAR_{safe_name}_{timestamp}.json")
-    save_json(json_data, json_path)
+    try:
+        print(f"Loading CSV export from {export_path}...")
+        rows = load_csv(export_path)
+        print(f"  Loaded {len(rows)} rows")
 
-    key_path = os.path.join(output_dir, 'internal', f"{vendor_name.replace(' ', '_')}_REDACTION_KEY_{safe_name}_{timestamp}.json")
-    save_json(engine.get_redaction_key(), key_path)
+        if rows:
+            columns = list(rows[0].keys())
+            print(f"  Columns: {', '.join(columns[:10])}{'...' if len(columns) > 10 else ''}")
 
-    stats = engine.get_stats()
-    print(f"\n✓ {vendor_name}: {len(redacted_records)} records processed")
-    print(f"  Redacted: {stats['user']} users, {stats['external']} external")
-    print(f"  → {docx_path}")
-    print(f"  → {json_path}")
+            # Auto-detect columns
+            detected_name = name_col or detect_column(columns, NAME_COLUMNS)
+            detected_email = email_col or detect_column(columns, EMAIL_COLUMNS)
+            print(f"  Detected name column: {detected_name or 'None'}")
+            print(f"  Detected email column: {detected_email or 'None'}")
 
-    return docx_path, json_path
+        print(f"\nSearching for data subject: {data_subject_name}...")
+        data_subject = find_data_subject(rows, data_subject_name, data_subject_email, name_col, email_col)
+        ds_id = data_subject['id']
+        print(f"  Found: {data_subject['name']} ({data_subject.get('email', 'no email')})")
+
+        print("Building redaction map...")
+        engine = RedactionEngine(data_subject_name, data_subject_email)
+
+        users = extract_users(rows, name_col, email_col)
+        for user_id, user_info in users.items():
+            engine.add_user(user_id, user_info.get('name'), user_info.get('email'))
+        print(f"  Mapped {engine.get_total_redactions()} entities for redaction")
+
+        for name in (extra_redactions or []):
+            engine.add_external(name)
+
+        print("Extracting profile data...")
+        profile = extract_profile(data_subject)
+
+        print("Extracting records...")
+        records = extract_records(rows, data_subject, name_col, email_col)
+        print(f"  Found {len(records)} records for data subject")
+
+        print("Applying redactions...")
+        redacted_records = []
+        for record in records:
+            redacted = record.copy()
+            if 'content' in redacted:
+                redacted['content'] = engine.redact(str(redacted['content']))
+            redacted_records.append(redacted)
+
+        safe_name = safe_filename(data_subject_name)
+        timestamp = get_timestamp()
+
+        # Derive vendor name from filename
+        vendor_name = os.path.splitext(os.path.basename(export_path))[0]
+        vendor_name = vendor_name.replace('_export', '').replace('-export', '')
+        vendor_name = vendor_name.replace('_', ' ').replace('-', ' ').title()
+        if not vendor_name or vendor_name.lower() == 'export':
+            vendor_name = VENDOR_NAME
+
+        print("Generating Word report...")
+        doc = create_vendor_report(
+            vendor_name=vendor_name,
+            data_subject_name=data_subject_name,
+            data_subject_email=data_subject_email,
+            profile_data=profile,
+            records=redacted_records,
+            redaction_stats=engine.get_stats(),
+            export_filename=os.path.basename(export_path)
+        )
+        docx_path = os.path.join(output_dir, f"{vendor_name.replace(' ', '_')}_DSAR_{safe_name}_{timestamp}.docx")
+        doc.save(docx_path)
+
+        print("Generating JSON export...")
+        json_data = {
+            'vendor': vendor_name,
+            'data_subject': data_subject_name,
+            'email': data_subject_email,
+            'generated': datetime.now().isoformat(),
+            'profile': profile,
+            'records': redacted_records,
+            'record_count': len(redacted_records),
+        }
+        json_path = os.path.join(output_dir, f"{vendor_name.replace(' ', '_')}_DSAR_{safe_name}_{timestamp}.json")
+        save_json(json_data, json_path)
+
+        key_path = os.path.join(output_dir, 'internal', f"{vendor_name.replace(' ', '_')}_REDACTION_KEY_{safe_name}_{timestamp}.json")
+        save_json(engine.get_redaction_key(), key_path)
+
+        stats = engine.get_stats()
+        print(f"\n✓ {vendor_name}: {len(redacted_records)} records processed")
+        print(f"  Redacted: {stats['user']} users, {stats['external']} external")
+        print(f"  → {docx_path}")
+        print(f"  → {json_path}")
+
+        elapsed = time.time() - start_time
+        log_event(
+            'processing_complete',
+            output_dir=output_dir,
+            vendor=VENDOR_NAME,
+            data_subject_name=data_subject_name,
+            data_subject_email=data_subject_email,
+            status='success',
+            records_found=len(records),
+            records_processed=len(redacted_records),
+            redaction_stats=stats,
+            files_generated=[os.path.basename(docx_path), os.path.basename(json_path)],
+            execution_time_seconds=round(elapsed, 2),
+        )
+
+        return docx_path, json_path
+
+    except Exception as e:
+        elapsed = time.time() - start_time
+        log_event(
+            'processing_failed',
+            output_dir=output_dir,
+            vendor=VENDOR_NAME,
+            data_subject_name=data_subject_name,
+            data_subject_email=data_subject_email,
+            status='failure',
+            error=str(e),
+            execution_time_seconds=round(elapsed, 2),
+        )
+        raise
 
 
 if __name__ == '__main__':
