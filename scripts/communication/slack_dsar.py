@@ -239,14 +239,23 @@ def extract_profile(data_subject: Dict) -> Dict[str, Any]:
 
 def extract_records(
     data: Dict[str, Any],
-    data_subject_id: str
+    data_subject_id: str,
+    data_subject_name: str = None,
+    data_subject_email: str = None
 ) -> List[Dict]:
     """
     Extract all messages and activities for the data subject.
 
+    GDPR Compliance: Includes messages where the data subject is:
+    - The author of the message
+    - @mentioned in the message (e.g., <@U12345>)
+    - Named in the message body (name or email appears in text)
+
     Args:
         data: Loaded Slack export data
         data_subject_id: User ID of the data subject
+        data_subject_name: Name of the data subject (for text matching)
+        data_subject_email: Email of the data subject (for text matching)
 
     Returns:
         List of activity records
@@ -260,6 +269,11 @@ def extract_records(
         channel_name = channel.get('name', channel_id)
         channel_names[channel_id] = channel_name
 
+    # Build search patterns for mentions
+    mention_pattern = f'<@{data_subject_id}>'  # Slack @mention format
+    name_lower = data_subject_name.lower() if data_subject_name else None
+    email_lower = data_subject_email.lower() if data_subject_email else None
+
     # Process messages
     messages = data.get('messages', [])
     total = len(messages)
@@ -267,8 +281,23 @@ def extract_records(
     for i, msg in enumerate(messages):
         print_progress(i + 1, total, "Processing messages")
 
-        # Only include messages from the data subject
-        if msg.get('user') != data_subject_id:
+        text = msg.get('text', '')
+        text_lower = text.lower()
+
+        # Check if data subject is the author
+        is_author = msg.get('user') == data_subject_id
+
+        # Check if data subject is @mentioned
+        is_mentioned = mention_pattern in text
+
+        # Check if data subject's name appears in message
+        name_in_text = name_lower and name_lower in text_lower
+
+        # Check if data subject's email appears in message
+        email_in_text = email_lower and email_lower in text_lower
+
+        # GDPR: Include if authored by OR mentions the data subject
+        if not (is_author or is_mentioned or name_in_text or email_in_text):
             continue
 
         # Get channel name
@@ -307,6 +336,17 @@ def extract_records(
             reactions = [r.get('name') for r in msg.get('reactions', [])]
             text = f"{text}\n[Reactions received: {', '.join(reactions)}]"
 
+        # Determine the data subject's relationship to this message
+        relationship = []
+        if is_author:
+            relationship.append('author')
+        if is_mentioned:
+            relationship.append('@mentioned')
+        if name_in_text and not is_author:
+            relationship.append('named')
+        if email_in_text:
+            relationship.append('email referenced')
+
         records.append({
             'date': date_str,
             'type': msg_type,
@@ -314,6 +354,7 @@ def extract_records(
             'content': text,
             'thread_ts': msg.get('thread_ts'),
             'reply_count': msg.get('reply_count', 0),
+            'data_subject_relationship': ', '.join(relationship),
         })
 
     return records
@@ -416,7 +457,7 @@ def process(
         profile = extract_profile(data_subject)
 
         print("Extracting activity records...")
-        records = extract_records(data, ds_id)
+        records = extract_records(data, ds_id, data_subject_name, data_subject_email)
         print(f"  Found {len(records)} records for data subject")
 
         # 7. Extract channel memberships

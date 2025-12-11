@@ -119,11 +119,44 @@ def extract_profile(data_subject: Dict) -> Dict[str, Any]:
 
 def extract_records(
     data: Dict[str, Any],
-    data_subject_id: str
+    data_subject_id: str,
+    data_subject_name: str = None,
+    data_subject_email: str = None
 ) -> List[Dict]:
-    """Extract all pages, comments, and activity for the data subject."""
+    """
+    Extract all pages, comments, and activity for the data subject.
+
+    GDPR Compliance: Includes content where the data subject is:
+    - The creator/editor/author of the content
+    - @mentioned in the content (Confluence uses @user format)
+    - Named in the content body (name or email appears in text)
+    """
     records = []
     ds_id = str(data_subject_id)
+    name_lower = data_subject_name.lower() if data_subject_name else None
+    email_lower = data_subject_email.lower() if data_subject_email else None
+
+    def is_mentioned_in(text: str) -> bool:
+        """Check if data subject is mentioned in text."""
+        if not text:
+            return False
+        text_lower = text.lower()
+        if name_lower and name_lower in text_lower:
+            return True
+        if email_lower and email_lower in text_lower:
+            return True
+        return False
+
+    def get_relationship(roles: list, text: str) -> str:
+        """Determine data subject's relationship to the content."""
+        relationships = list(roles)
+        if text:
+            text_lower = text.lower()
+            if name_lower and name_lower in text_lower and not roles:
+                relationships.append('named')
+            if email_lower and email_lower in text_lower:
+                relationships.append('email referenced')
+        return ', '.join(relationships) if relationships else 'referenced'
 
     # Build space lookup
     spaces = {}
@@ -140,27 +173,33 @@ def extract_records(
         created_by_id = str(created_by.get('accountId') or created_by.get('key', ''))
         updated_by_id = str(last_updated_by.get('accountId') or last_updated_by.get('key', ''))
 
-        if created_by_id == ds_id or updated_by_id == ds_id:
+        body = page.get('body', {})
+        content = ''
+        if isinstance(body, dict):
+            storage = body.get('storage', body.get('view', {}))
+            content = strip_html(storage.get('value', '') if isinstance(storage, dict) else str(storage))[:500]
+
+        title = page.get('title', '')
+        is_creator = created_by_id == ds_id
+        is_editor = updated_by_id == ds_id
+        is_mentioned = is_mentioned_in(content) or is_mentioned_in(title)
+
+        if is_creator or is_editor or is_mentioned:
             space_key = page.get('space', {}).get('key', page.get('spaceKey', ''))
             space_name = spaces.get(space_key, space_key)
 
             role = []
-            if created_by_id == ds_id:
+            if is_creator:
                 role.append('creator')
-            if updated_by_id == ds_id:
+            if is_editor:
                 role.append('editor')
-
-            body = page.get('body', {})
-            content = ''
-            if isinstance(body, dict):
-                storage = body.get('storage', body.get('view', {}))
-                content = strip_html(storage.get('value', '') if isinstance(storage, dict) else str(storage))[:500]
 
             records.append({
                 'date': format_date(history.get('createdDate') or page.get('created')),
                 'type': page.get('type', 'page'),
                 'category': f"Pages / {space_name}",
-                'content': f"Title: {page.get('title')}\nRole: {', '.join(role)}\nStatus: {page.get('status', 'current')}\nVersion: {page.get('version', {}).get('number', 1) if isinstance(page.get('version'), dict) else 'N/A'}\nContent Preview: {content}",
+                'content': f"Title: {title}\nRole: {', '.join(role) if role else 'mentioned'}\nStatus: {page.get('status', 'current')}\nVersion: {page.get('version', {}).get('number', 1) if isinstance(page.get('version'), dict) else 'N/A'}\nContent Preview: {content}",
+                'data_subject_relationship': get_relationship(role, content + ' ' + title),
             })
 
     # Comments
@@ -168,21 +207,25 @@ def extract_records(
         author = comment.get('history', {}).get('createdBy', comment.get('author', {}))
         author_id = str(author.get('accountId') or author.get('key', ''))
 
-        if author_id == ds_id:
+        body = comment.get('body', {})
+        content = ''
+        if isinstance(body, dict):
+            storage = body.get('storage', body.get('view', {}))
+            content = strip_html(storage.get('value', '') if isinstance(storage, dict) else str(storage))
+
+        is_author = author_id == ds_id
+        is_mentioned = is_mentioned_in(content)
+
+        if is_author or is_mentioned:
             container = comment.get('container', {})
             container_title = container.get('title', 'Unknown') if isinstance(container, dict) else 'Unknown'
-
-            body = comment.get('body', {})
-            content = ''
-            if isinstance(body, dict):
-                storage = body.get('storage', body.get('view', {}))
-                content = strip_html(storage.get('value', '') if isinstance(storage, dict) else str(storage))
 
             records.append({
                 'date': format_date(comment.get('history', {}).get('createdDate') or comment.get('created')),
                 'type': 'comment',
                 'category': f"Comments / {container_title}",
                 'content': content,
+                'data_subject_relationship': get_relationship(['author'] if is_author else [], content),
             })
 
     # Blog posts
@@ -191,21 +234,26 @@ def extract_records(
         created_by = history.get('createdBy', blog.get('creator', {}))
         created_by_id = str(created_by.get('accountId') or created_by.get('key', ''))
 
-        if created_by_id == ds_id:
+        body = blog.get('body', {})
+        content = ''
+        if isinstance(body, dict):
+            storage = body.get('storage', body.get('view', {}))
+            content = strip_html(storage.get('value', '') if isinstance(storage, dict) else str(storage))[:500]
+
+        title = blog.get('title', '')
+        is_creator = created_by_id == ds_id
+        is_mentioned = is_mentioned_in(content) or is_mentioned_in(title)
+
+        if is_creator or is_mentioned:
             space_key = blog.get('space', {}).get('key', blog.get('spaceKey', ''))
             space_name = spaces.get(space_key, space_key)
-
-            body = blog.get('body', {})
-            content = ''
-            if isinstance(body, dict):
-                storage = body.get('storage', body.get('view', {}))
-                content = strip_html(storage.get('value', '') if isinstance(storage, dict) else str(storage))[:500]
 
             records.append({
                 'date': format_date(history.get('createdDate') or blog.get('created')),
                 'type': 'blogpost',
                 'category': f"Blog Posts / {space_name}",
-                'content': f"Title: {blog.get('title')}\nContent Preview: {content}",
+                'content': f"Title: {title}\nContent Preview: {content}",
+                'data_subject_relationship': get_relationship(['creator'] if is_creator else [], content + ' ' + title),
             })
 
     # Attachments
@@ -223,6 +271,7 @@ def extract_records(
                 'type': 'attachment',
                 'category': f"Attachments / {container_title}",
                 'content': f"File: {attachment.get('title')}\nMedia Type: {attachment.get('mediaType', 'N/A')}\nSize: {attachment.get('extensions', {}).get('fileSize', 'N/A') if isinstance(attachment.get('extensions'), dict) else 'N/A'} bytes",
+                'data_subject_relationship': 'creator',
             })
 
     # Labels (if assigned by user)
@@ -234,6 +283,7 @@ def extract_records(
                 'type': 'label',
                 'category': 'Labels',
                 'content': f"Label: {label.get('name') or label.get('label')}\nPrefix: {label.get('prefix', 'global')}",
+                'data_subject_relationship': 'owner',
             })
 
     # Watches/subscriptions
@@ -245,6 +295,7 @@ def extract_records(
                 'type': 'watch',
                 'category': 'Watches',
                 'content': f"Watching: {content.get('title', 'Unknown') if isinstance(content, dict) else 'Content'}",
+                'data_subject_relationship': 'subscriber',
             })
 
     # Sort by date
@@ -298,7 +349,7 @@ def process(
         profile = extract_profile(data_subject)
 
         print("Extracting activity records...")
-        records = extract_records(data, ds_id)
+        records = extract_records(data, ds_id, data_subject_name, data_subject_email)
         print(f"  Found {len(records)} records for data subject")
 
         print("Applying redactions...")

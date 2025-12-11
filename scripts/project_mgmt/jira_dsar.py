@@ -101,16 +101,58 @@ def extract_profile(data_subject: Dict) -> Dict[str, Any]:
 
 def extract_records(
     data: Dict[str, Any],
-    data_subject_id: str
+    data_subject_id: str,
+    data_subject_name: str = None,
+    data_subject_email: str = None
 ) -> List[Dict]:
-    """Extract all issues, comments, and worklogs for the data subject."""
+    """
+    Extract all issues, comments, and worklogs for the data subject.
+
+    GDPR Compliance: Includes content where the data subject is:
+    - The reporter/assignee/creator of the issue
+    - The author of comments or worklogs
+    - @mentioned in the content (Jira uses [~accountId] or @user format)
+    - Named in the content body (name or email appears in text)
+    """
     records = []
     ds_id = str(data_subject_id)
+    name_lower = data_subject_name.lower() if data_subject_name else None
+    email_lower = data_subject_email.lower() if data_subject_email else None
+
+    def is_mentioned_in(text: str) -> bool:
+        """Check if data subject is mentioned in text."""
+        if not text:
+            return False
+        text_lower = text.lower()
+        # Check for Jira @mention format [~accountId] or [~username]
+        if f'[~{ds_id}]' in text or f'[~{ds_id.lower()}]' in text_lower:
+            return True
+        if name_lower and name_lower in text_lower:
+            return True
+        if email_lower and email_lower in text_lower:
+            return True
+        return False
+
+    def get_relationship(roles: list, text: str) -> str:
+        """Determine data subject's relationship to the content."""
+        relationships = list(roles)
+        if text:
+            text_lower = text.lower()
+            if f'[~{ds_id}]' in text or f'[~{ds_id.lower()}]' in text_lower:
+                relationships.append('@mentioned')
+            if name_lower and name_lower in text_lower and not roles:
+                relationships.append('named')
+            if email_lower and email_lower in text_lower:
+                relationships.append('email referenced')
+        return ', '.join(relationships) if relationships else 'referenced'
 
     # Build project lookup
     projects = {str(p.get('id')): p.get('name') or p.get('key') for p in data.get('projects', [])}
 
-    # Extract issues
+    # Track processed issues to handle comments on non-involved issues
+    processed_issue_keys = set()
+
+    # Extract issues where data subject is involved or mentioned
     for issue in data.get('issues', []):
         fields = issue.get('fields', {})
         reporter = fields.get('reporter', {})
@@ -121,52 +163,73 @@ def extract_records(
         assignee_id = assignee.get('accountId') or assignee.get('key') or assignee.get('name') if assignee else None
         creator_id = creator.get('accountId') or creator.get('key') or creator.get('name') if creator else None
 
-        # Check if data subject is involved
-        if ds_id not in [str(reporter_id), str(assignee_id), str(creator_id)]:
-            continue
+        description = fields.get('description', '') or ''
+        summary = fields.get('summary', '') or ''
+
+        is_reporter = str(reporter_id) == ds_id
+        is_assignee = str(assignee_id) == ds_id
+        is_creator = str(creator_id) == ds_id
+        is_mentioned = is_mentioned_in(description) or is_mentioned_in(summary)
 
         issue_key = issue.get('key', '')
         project = projects.get(str(fields.get('project', {}).get('id', '')), 'Unknown')
 
-        role = []
-        if str(reporter_id) == ds_id:
-            role.append('reporter')
-        if str(assignee_id) == ds_id:
-            role.append('assignee')
-        if str(creator_id) == ds_id:
-            role.append('creator')
+        # Check if data subject is involved in the issue itself
+        if is_reporter or is_assignee or is_creator or is_mentioned:
+            processed_issue_keys.add(issue_key)
 
-        records.append({
-            'date': format_date(fields.get('created')),
-            'type': 'issue',
-            'category': f"{project} / {issue_key}",
-            'content': f"Summary: {fields.get('summary')}\nRole: {', '.join(role)}\nStatus: {fields.get('status', {}).get('name', 'Unknown')}\nDescription: {strip_html(fields.get('description', '') or '')}",
-        })
+            role = []
+            if is_reporter:
+                role.append('reporter')
+            if is_assignee:
+                role.append('assignee')
+            if is_creator:
+                role.append('creator')
 
-        # Extract comments on this issue
+            records.append({
+                'date': format_date(fields.get('created')),
+                'type': 'issue',
+                'category': f"{project} / {issue_key}",
+                'content': f"Summary: {summary}\nRole: {', '.join(role) if role else 'mentioned'}\nStatus: {fields.get('status', {}).get('name', 'Unknown')}\nDescription: {strip_html(description)}",
+                'data_subject_relationship': get_relationship(role, description + ' ' + summary),
+            })
+
+        # Extract comments - check ALL comments for mentions
         comments = fields.get('comment', {}).get('comments', [])
         for comment in comments:
             author = comment.get('author', {})
             author_id = author.get('accountId') or author.get('key') or author.get('name')
-            if str(author_id) == ds_id:
+            body = comment.get('body', '') or ''
+
+            is_author = str(author_id) == ds_id
+            is_comment_mentioned = is_mentioned_in(body)
+
+            if is_author or is_comment_mentioned:
                 records.append({
                     'date': format_date(comment.get('created')),
                     'type': 'comment',
                     'category': f"{project} / {issue_key}",
-                    'content': strip_html(comment.get('body', '')),
+                    'content': strip_html(body),
+                    'data_subject_relationship': get_relationship(['author'] if is_author else [], body),
                 })
 
-        # Extract worklogs on this issue
+        # Extract worklogs
         worklogs = fields.get('worklog', {}).get('worklogs', [])
         for worklog in worklogs:
             author = worklog.get('author', {})
             author_id = author.get('accountId') or author.get('key') or author.get('name')
-            if str(author_id) == ds_id:
+            worklog_comment = worklog.get('comment', '') or ''
+
+            is_author = str(author_id) == ds_id
+            is_worklog_mentioned = is_mentioned_in(worklog_comment)
+
+            if is_author or is_worklog_mentioned:
                 records.append({
                     'date': format_date(worklog.get('started')),
                     'type': 'worklog',
                     'category': f"{project} / {issue_key}",
-                    'content': f"Time logged: {worklog.get('timeSpent', 'Unknown')}\nComment: {strip_html(worklog.get('comment', '') or '')}",
+                    'content': f"Time logged: {worklog.get('timeSpent', 'Unknown')}\nComment: {strip_html(worklog_comment)}",
+                    'data_subject_relationship': get_relationship(['author'] if is_author else [], worklog_comment),
                 })
 
     # Sort by date
@@ -220,7 +283,7 @@ def process(
         profile = extract_profile(data_subject)
 
         print("Extracting activity records...")
-        records = extract_records(data, ds_id)
+        records = extract_records(data, ds_id, data_subject_name, data_subject_email)
         print(f"  Found {len(records)} records for data subject")
 
         print("Applying redactions...")

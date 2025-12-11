@@ -106,39 +106,90 @@ def extract_profile(data_subject: Dict) -> Dict[str, Any]:
 
 def extract_records(
     data: Dict[str, Any],
-    data_subject_id: str
+    data_subject_id: str,
+    data_subject_name: str = None,
+    data_subject_email: str = None
 ) -> List[Dict]:
-    """Extract all tickets and comments for the data subject."""
+    """
+    Extract all tickets and comments for the data subject.
+
+    GDPR Compliance: Includes content where the data subject is:
+    - The requester/submitter/author of the content
+    - Named in the content body (name or email appears in text)
+    """
     records = []
     ds_id = str(data_subject_id)
+    name_lower = data_subject_name.lower() if data_subject_name else None
+    email_lower = data_subject_email.lower() if data_subject_email else None
+
+    def is_mentioned_in(text: str) -> bool:
+        """Check if data subject is mentioned in text."""
+        if not text:
+            return False
+        text_lower = text.lower()
+        if name_lower and name_lower in text_lower:
+            return True
+        if email_lower and email_lower in text_lower:
+            return True
+        return False
+
+    def get_relationship(roles: list, text: str) -> str:
+        """Determine data subject's relationship to the content."""
+        relationships = list(roles)
+        if text:
+            text_lower = text.lower()
+            if name_lower and name_lower in text_lower and 'requester' not in roles and 'submitter' not in roles and 'author' not in roles:
+                relationships.append('named')
+            if email_lower and email_lower in text_lower:
+                relationships.append('email referenced')
+        return ', '.join(relationships) if relationships else 'referenced'
 
     # Build ticket lookup
     tickets = {str(t.get('id')): t for t in data.get('tickets', [])}
 
-    # Find tickets where user is requester or submitter
+    # Find tickets where user is requester, submitter, or mentioned
     for ticket in data.get('tickets', []):
         requester_id = str(ticket.get('requester_id', ''))
         submitter_id = str(ticket.get('submitter_id', ''))
+        description = ticket.get('description', '') or ''
+        subject = ticket.get('subject', '') or ''
 
-        if requester_id == ds_id or submitter_id == ds_id:
+        is_requester = requester_id == ds_id
+        is_submitter = submitter_id == ds_id
+        is_mentioned = is_mentioned_in(description) or is_mentioned_in(subject)
+
+        if is_requester or is_submitter or is_mentioned:
+            roles = []
+            if is_requester:
+                roles.append('requester')
+            if is_submitter:
+                roles.append('submitter')
+
             records.append({
                 'date': format_date(ticket.get('created_at')),
                 'type': 'ticket_created',
                 'category': f"Ticket #{ticket.get('id')}",
-                'content': f"Subject: {ticket.get('subject')}\nStatus: {ticket.get('status')}\nPriority: {ticket.get('priority')}\nDescription: {strip_html(ticket.get('description', ''))}",
+                'content': f"Subject: {subject}\nStatus: {ticket.get('status')}\nPriority: {ticket.get('priority')}\nDescription: {strip_html(description)}",
+                'data_subject_relationship': get_relationship(roles, description + ' ' + subject),
             })
 
-    # Extract comments by the data subject
+    # Extract comments by or mentioning the data subject
     for comment in data.get('comments', data.get('ticket_comments', [])):
         author_id = str(comment.get('author_id', ''))
-        if author_id == ds_id:
+        body = comment.get('body', comment.get('plain_body', '')) or ''
+
+        is_author = author_id == ds_id
+        is_mentioned = is_mentioned_in(body)
+
+        if is_author or is_mentioned:
             ticket_id = comment.get('ticket_id')
             ticket = tickets.get(str(ticket_id), {})
             records.append({
                 'date': format_date(comment.get('created_at')),
                 'type': 'comment',
                 'category': f"Ticket #{ticket_id} - {ticket.get('subject', 'Unknown')}",
-                'content': strip_html(comment.get('body', comment.get('plain_body', ''))),
+                'content': strip_html(body),
+                'data_subject_relationship': get_relationship(['author'] if is_author else [], body),
             })
 
     # Extract ticket events
@@ -149,6 +200,7 @@ def extract_records(
                 'type': 'ticket_update',
                 'category': f"Ticket #{event.get('ticket_id')}",
                 'content': f"Event: {event.get('event_type', 'update')}",
+                'data_subject_relationship': 'updater',
             })
 
     # Sort by date
@@ -202,7 +254,7 @@ def process(
         profile = extract_profile(data_subject)
 
         print("Extracting activity records...")
-        records = extract_records(data, ds_id)
+        records = extract_records(data, ds_id, data_subject_name, data_subject_email)
         print(f"  Found {len(records)} records for data subject")
 
         print("Applying redactions...")

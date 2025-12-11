@@ -143,13 +143,46 @@ def extract_profile(data_subject: Dict) -> Dict[str, Any]:
 
 def extract_records(
     data: Dict[str, Any],
-    data_subject_id: str
+    data_subject_id: str,
+    data_subject_name: str = None,
+    data_subject_email: str = None
 ) -> List[Dict]:
-    """Extract all pages, blocks, and comments for the data subject."""
+    """
+    Extract all pages, blocks, and comments for the data subject.
+
+    GDPR Compliance: Includes content where the data subject is:
+    - The creator/editor of the content
+    - @mentioned in the content (Notion uses @user format)
+    - Named in the content body (name or email appears in text)
+    """
     records = []
     ds_id = str(data_subject_id)
+    name_lower = data_subject_name.lower() if data_subject_name else None
+    email_lower = data_subject_email.lower() if data_subject_email else None
 
-    # Extract pages created/edited by user
+    def is_mentioned_in(text: str) -> bool:
+        """Check if data subject is mentioned in text."""
+        if not text:
+            return False
+        text_lower = text.lower()
+        if name_lower and name_lower in text_lower:
+            return True
+        if email_lower and email_lower in text_lower:
+            return True
+        return False
+
+    def get_relationship(roles: list, text: str) -> str:
+        """Determine data subject's relationship to the content."""
+        relationships = list(roles)
+        if text:
+            text_lower = text.lower()
+            if name_lower and name_lower in text_lower and not roles:
+                relationships.append('named')
+            if email_lower and email_lower in text_lower:
+                relationships.append('email referenced')
+        return ', '.join(relationships) if relationships else 'referenced'
+
+    # Extract pages created/edited by user or mentioning user
     for page in data.get('pages', []):
         created_by = page.get('created_by', {})
         last_edited_by = page.get('last_edited_by', {})
@@ -157,22 +190,24 @@ def extract_records(
         created_by_id = created_by.get('id') if isinstance(created_by, dict) else None
         edited_by_id = last_edited_by.get('id') if isinstance(last_edited_by, dict) else None
 
-        is_involved = str(created_by_id) == ds_id or str(edited_by_id) == ds_id
-
-        if is_involved or page.get('type') == 'file':
-            title = page.get('title', '')
+        title = page.get('title', '')
+        if isinstance(title, list):
+            # Rich text format
+            title = ''.join([t.get('plain_text', '') for t in title])
+        elif isinstance(title, dict):
+            title = title.get('title', [{}])
             if isinstance(title, list):
-                # Rich text format
                 title = ''.join([t.get('plain_text', '') for t in title])
-            elif isinstance(title, dict):
-                title = title.get('title', [{}])
-                if isinstance(title, list):
-                    title = ''.join([t.get('plain_text', '') for t in title])
 
+        is_creator = str(created_by_id) == ds_id
+        is_editor = str(edited_by_id) == ds_id
+        is_mentioned = is_mentioned_in(title)
+
+        if is_creator or is_editor or is_mentioned or page.get('type') == 'file':
             role = []
-            if str(created_by_id) == ds_id:
+            if is_creator:
                 role.append('creator')
-            if str(edited_by_id) == ds_id:
+            if is_editor:
                 role.append('editor')
 
             page_type = page.get('object', page.get('type', 'page'))
@@ -181,36 +216,45 @@ def extract_records(
                 'date': format_date(page.get('created_time') or page.get('last_edited_time')),
                 'type': page_type,
                 'category': 'Pages',
-                'content': f"Title: {title or page.get('file_path', 'Untitled')}\nRole: {', '.join(role) if role else 'contributor'}\nParent: {page.get('parent', {}).get('type', 'workspace')}",
+                'content': f"Title: {title or page.get('file_path', 'Untitled')}\nRole: {', '.join(role) if role else 'mentioned'}\nParent: {page.get('parent', {}).get('type', 'workspace')}",
+                'data_subject_relationship': get_relationship(role, title),
             })
 
-    # Extract comments by user
+    # Extract comments by or mentioning user
     for comment in data.get('comments', []):
         created_by = comment.get('created_by', {})
-        if str(created_by.get('id', '')) == ds_id:
-            rich_text = comment.get('rich_text', [])
-            text = ''.join([t.get('plain_text', '') for t in rich_text]) if isinstance(rich_text, list) else str(rich_text)
+        rich_text = comment.get('rich_text', [])
+        text = ''.join([t.get('plain_text', '') for t in rich_text]) if isinstance(rich_text, list) else str(rich_text)
 
+        is_author = str(created_by.get('id', '')) == ds_id
+        is_mentioned = is_mentioned_in(text)
+
+        if is_author or is_mentioned:
             records.append({
                 'date': format_date(comment.get('created_time')),
                 'type': 'comment',
                 'category': 'Comments',
                 'content': text,
+                'data_subject_relationship': get_relationship(['author'] if is_author else [], text),
             })
 
     # Extract database entries
     for db in data.get('databases', []):
         created_by = db.get('created_by', {})
-        if str(created_by.get('id', '')) == ds_id:
-            title = db.get('title', [])
-            if isinstance(title, list):
-                title = ''.join([t.get('plain_text', '') for t in title])
+        title = db.get('title', [])
+        if isinstance(title, list):
+            title = ''.join([t.get('plain_text', '') for t in title])
 
+        is_creator = str(created_by.get('id', '')) == ds_id
+        is_mentioned = is_mentioned_in(title)
+
+        if is_creator or is_mentioned:
             records.append({
                 'date': format_date(db.get('created_time')),
                 'type': 'database',
                 'category': 'Databases',
                 'content': f"Database: {title or 'Untitled'}",
+                'data_subject_relationship': get_relationship(['creator'] if is_creator else [], title),
             })
 
     # Sort by date
@@ -264,7 +308,7 @@ def process(
         profile = extract_profile(data_subject)
 
         print("Extracting activity records...")
-        records = extract_records(data, ds_id)
+        records = extract_records(data, ds_id, data_subject_name, data_subject_email)
         print(f"  Found {len(records)} records for data subject")
 
         print("Applying redactions...")
