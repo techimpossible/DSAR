@@ -76,20 +76,41 @@ pip install -r requirements.txt
 
 ## Quick Start
 
-### Process a single vendor export
+### Option 1: Web UI (Recommended)
+
+The easiest way to use the DSAR Toolkit is through the web interface:
+
+```bash
+# Install dependencies (first time only)
+pip install -r requirements.txt
+
+# Start the web UI
+streamlit run scripts/web_ui.py
+```
+
+This opens a browser interface where you can:
+- Upload vendor export files
+- Enter data subject information
+- Select the vendor processor
+- Download generated reports
+- Compile multi-vendor DSAR packages
+
+### Option 2: Command Line
+
+#### Process a single vendor export
 
 ```bash
 cd scripts/communication
 python slack_dsar.py ~/exports/slack_export.zip "John Smith" --email john@company.com
 ```
 
-### Process with additional redactions
+#### Process with additional redactions
 
 ```bash
 python slack_dsar.py export.zip "John Smith" --email john@company.com --redact "External Contact" "Vendor Name"
 ```
 
-### Compile multi-vendor package
+#### Compile multi-vendor package
 
 ```bash
 cd scripts
@@ -144,7 +165,8 @@ DSAR/
 │   ├── generic/
 │   │   ├── generic_json_dsar.py
 │   │   └── generic_csv_dsar.py
-│   └── compile_package.py
+│   ├── compile_package.py
+│   └── web_ui.py           # Streamlit web interface
 ├── tests/
 │   ├── test_redaction.py
 │   ├── test_docgen.py
