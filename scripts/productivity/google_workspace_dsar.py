@@ -5,10 +5,12 @@ Google Workspace DSAR Processor
 Export source: Google Admin Console > Data & personalization > Download your data
                OR Google Takeout (takeout.google.com)
 Format: ZIP containing various JSON/MBOX/HTML files from Google services
+        OR standalone MBOX file from Gmail export
 
 Usage:
     python google_workspace_dsar.py takeout.zip "John Smith" --email john@company.com
     python google_workspace_dsar.py export.json "John Smith" --email john@company.com
+    python google_workspace_dsar.py emails.mbox "John Smith" --email john@company.com
 """
 
 import sys
@@ -16,6 +18,9 @@ import os
 import zipfile
 import json
 import time
+import mailbox
+import email
+from email.utils import parsedate_to_datetime, parseaddr
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 
@@ -41,11 +46,141 @@ VENDOR_NAME = "Google_Workspace"
 
 
 def load_export(export_path: str) -> Dict[str, Any]:
-    """Load Google Workspace export from ZIP or JSON."""
+    """Load Google Workspace export from ZIP, JSON, or MBOX."""
     if export_path.endswith('.zip'):
         return load_takeout_zip(export_path)
+    elif export_path.endswith('.mbox'):
+        return load_mbox(export_path)
     else:
         return load_json(export_path)
+
+
+def load_mbox(mbox_path: str) -> Dict[str, Any]:
+    """
+    Load and parse MBOX email export from Gmail/Google Workspace.
+
+    Args:
+        mbox_path: Path to the .mbox file
+
+    Returns:
+        Dictionary with emails and extracted profile/user info
+    """
+    data = {
+        'profile': {},
+        'users': [],
+        'drive_files': [],
+        'calendar_events': [],
+        'contacts': [],
+        'emails': [],
+        'chat_messages': [],
+        'activity': [],
+    }
+
+    # Track unique email addresses for user extraction
+    seen_emails = {}
+
+    mbox = mailbox.mbox(mbox_path)
+
+    for message in mbox:
+        try:
+            # Parse email metadata
+            msg_from = message.get('From', '')
+            msg_to = message.get('To', '')
+            msg_cc = message.get('Cc', '')
+            msg_subject = message.get('Subject', '(No Subject)')
+            msg_date = message.get('Date', '')
+
+            # Parse date
+            date_str = None
+            if msg_date:
+                try:
+                    dt = parsedate_to_datetime(msg_date)
+                    date_str = dt.isoformat()
+                except Exception:
+                    date_str = msg_date
+
+            # Extract sender info
+            from_name, from_email = parseaddr(msg_from)
+
+            # Extract recipients
+            to_addresses = []
+            for addr_field in [msg_to, msg_cc]:
+                if addr_field:
+                    # Handle multiple addresses
+                    for addr in addr_field.split(','):
+                        name, addr_email = parseaddr(addr.strip())
+                        if addr_email:
+                            to_addresses.append(addr_email)
+                            # Track unique addresses for user extraction
+                            if addr_email not in seen_emails:
+                                seen_emails[addr_email] = name or addr_email.split('@')[0]
+
+            # Track sender
+            if from_email and from_email not in seen_emails:
+                seen_emails[from_email] = from_name or from_email.split('@')[0]
+
+            # Get email body
+            body = ''
+            if message.is_multipart():
+                for part in message.walk():
+                    content_type = part.get_content_type()
+                    if content_type == 'text/plain':
+                        try:
+                            payload = part.get_payload(decode=True)
+                            if payload:
+                                charset = part.get_content_charset() or 'utf-8'
+                                body = payload.decode(charset, errors='replace')
+                                break
+                        except Exception:
+                            continue
+                    elif content_type == 'text/html' and not body:
+                        try:
+                            payload = part.get_payload(decode=True)
+                            if payload:
+                                charset = part.get_content_charset() or 'utf-8'
+                                body = strip_html(payload.decode(charset, errors='replace'))
+                        except Exception:
+                            continue
+            else:
+                try:
+                    payload = message.get_payload(decode=True)
+                    if payload:
+                        charset = message.get_content_charset() or 'utf-8'
+                        body = payload.decode(charset, errors='replace')
+                        if message.get_content_type() == 'text/html':
+                            body = strip_html(body)
+                except Exception:
+                    body = str(message.get_payload())
+
+            # Store email record
+            data['emails'].append({
+                'from': msg_from,
+                'from_email': from_email,
+                'from_name': from_name,
+                'to': msg_to,
+                'cc': msg_cc,
+                'to_addresses': to_addresses,
+                'subject': msg_subject,
+                'date': date_str,
+                'body': body[:5000] if body else '',  # Limit body size
+                'message_id': message.get('Message-ID', ''),
+                'labels': message.get('X-Gmail-Labels', ''),
+            })
+
+        except Exception:
+            continue
+
+    mbox.close()
+
+    # Convert seen emails to users list
+    for email_addr, name in seen_emails.items():
+        data['users'].append({
+            'email': email_addr,
+            'displayName': name,
+            'id': email_addr,
+        })
+
+    return data
 
 
 def load_takeout_zip(zip_path: str) -> Dict[str, Any]:
@@ -195,6 +330,14 @@ def extract_users(data: Dict[str, Any]) -> Dict[str, Dict]:
         if contact_id:
             users[str(contact_id)] = {'name': name, 'email': email_addr}
 
+    # From users list (populated by MBOX parsing)
+    for user in data.get('users', []):
+        user_email = user.get('email') or user.get('primaryEmail', '')
+        user_name = user.get('displayName') or user.get('name', {}).get('fullName', '')
+
+        if user_email:
+            users[user_email] = {'name': user_name, 'email': user_email}
+
     return users
 
 
@@ -320,6 +463,26 @@ def extract_records(
             'category': 'Google Contacts',
             'content': f"Name: {contact_name}\nEmail: {contact_email}\nPhone: {contact.get('phoneNumbers', [{}])[0].get('value', 'N/A') if contact.get('phoneNumbers') else 'N/A'}",
         })
+
+    # Emails (from MBOX export)
+    for email_msg in data.get('emails', []):
+        from_email = (email_msg.get('from_email') or '').lower()
+        to_addresses = [addr.lower() for addr in email_msg.get('to_addresses', [])]
+
+        # Include emails where data subject is sender or recipient
+        is_sender = ds_email_lower and ds_email_lower == from_email
+        is_recipient = ds_email_lower and ds_email_lower in to_addresses
+
+        if is_sender or is_recipient:
+            labels = email_msg.get('labels', 'Inbox')
+            body_preview = (email_msg.get('body') or '')[:1000]
+
+            records.append({
+                'date': format_date(email_msg.get('date')),
+                'type': 'email',
+                'category': f"Gmail / {labels}" if labels else 'Gmail',
+                'content': f"Subject: {email_msg.get('subject', '(No Subject)')}\nFrom: {email_msg.get('from', 'Unknown')}\nTo: {email_msg.get('to', 'Unknown')}\nCC: {email_msg.get('cc') or 'N/A'}\n\n{body_preview}",
+            })
 
     # Sort by date
     records.sort(key=lambda r: r.get('date', ''), reverse=True)
